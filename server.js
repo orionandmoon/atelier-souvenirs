@@ -31,19 +31,16 @@ app.use(cors({
 }));
 
 // ─── RATE LIMITING ────────────────────────────────────────────────────────────
-// Global : 100 requêtes / 15 min par IP
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000, max: 100,
   message: { error: 'Trop de requêtes, réessayez dans quelques minutes.' },
 }));
 
-// Stripe : 10 tentatives / 10 min par IP
 const stripeLimiter = rateLimit({
   windowMs: 10 * 60 * 1000, max: 10,
   message: { error: 'Trop de tentatives de paiement. Réessayez dans 10 minutes.' },
 });
 
-// Avis : 5 soumissions / heure par IP
 const reviewLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, max: 5,
   message: { error: 'Trop d\'avis soumis. Réessayez dans une heure.' },
@@ -82,7 +79,7 @@ function createMailer() {
   });
 }
 
-async function sendOrderConfirmationEmail({ email, name, items, total, orderId }) {
+async function sendOrderConfirmationEmail({ email, name, items, total, orderId, mrPoint }) {
   const mailer = createMailer();
   if (!mailer) return console.log('⚠️ SMTP non configuré');
 
@@ -94,6 +91,13 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId }
       <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:center">×${sanitizeNumber(i.quantity,1,99)||1}</td>
       <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right">${(parseFloat(i.price)*parseInt(i.quantity)).toFixed(2)} €</td>
     </tr>`).join('');
+
+  const mrHtml = mrPoint ? `
+    <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:10px;padding:16px;margin-top:12px;font-size:13px;color:#2c3e35">
+      📍 <strong>Point relais Mondial Relay</strong><br>
+      ${sanitizeString(mrPoint.nom, 100)}<br>
+      ${sanitizeString(mrPoint.adresse, 200)}, ${sanitizeString(mrPoint.cp, 10)} ${sanitizeString(mrPoint.ville, 100)}
+    </div>` : '';
 
   await mailer.sendMail({
     from: `"L'Atelier Souvenirs" <${process.env.SMTP_USER}>`,
@@ -121,10 +125,11 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId }
         <td style="padding:12px;font-weight:700;color:#c49a3c;text-align:right;font-size:18px">${parseFloat(total).toFixed(2)} €</td>
       </tr></tfoot>
     </table>
-    <div style="background:#faf8f5;border-radius:10px;padding:16px;font-size:13px;color:#2c3e35;line-height:2">
+    ${mrHtml}
+    <div style="background:#faf8f5;border-radius:10px;padding:16px;font-size:13px;color:#2c3e35;line-height:2;margin-top:12px">
       🎨 Fabrication en cours (1-3 jours ouvrés)<br>
       📦 Expédition sous 3-5 jours ouvrés<br>
-      🚚 Livraison Mondial Relay à domicile
+      🚚 Livraison Mondial Relay point relais
     </div>
   </div>
   <div style="background:#fff;border-radius:16px;padding:24px;text-align:center;border:1px solid #e8e4df;margin-bottom:16px">
@@ -133,7 +138,7 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId }
     <a href="${process.env.FRONTEND_URL}/review.html" style="display:inline-block;background:#e05a45;color:#fff;text-decoration:none;padding:12px 28px;border-radius:10px;font-weight:600;font-size:14px">✍️ Laisser un avis</a>
   </div>
   <div style="text-align:center;font-size:11px;color:#7a7570;padding-top:16px">
-    <p>© 2025 L'Atelier Souvenirs · Création Hyéroise</p>
+    <p>© 2026 L'Atelier Souvenirs · Création Hyéroise</p>
     <p style="margin-top:4px">Réf. : #${safeId.slice(-8).toUpperCase()}</p>
   </div>
 </div></body></html>`
@@ -155,14 +160,26 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     const pi = event.data.object;
     const clientEmail = sanitizeEmail(pi.metadata.client_email || '');
     console.log(`✅ Paiement reçu : ${(pi.amount/100).toFixed(2)}€ — ${clientEmail || 'N/A'}`);
+    console.log(`   Client  : ${pi.metadata.client_nom || 'N/A'}`);
+    console.log(`   Produit : ${pi.metadata.produit || 'N/A'}`);
+    console.log(`   Relais  : ${pi.metadata.mr_point_nom || 'N/A'} — ${pi.metadata.mr_point_ville || 'N/A'}`);
 
     if (clientEmail) {
       try {
         const items = JSON.parse(pi.metadata.items_json || '[]');
+        const mrPoint = pi.metadata.mr_point_nom ? {
+          nom:     pi.metadata.mr_point_nom,
+          adresse: pi.metadata.mr_point_adr,
+          cp:      pi.metadata.mr_point_cp,
+          ville:   pi.metadata.mr_point_ville,
+        } : null;
         await sendOrderConfirmationEmail({
           email: clientEmail,
-          name: pi.metadata.client_nom || 'Client',
-          items, total: pi.amount / 100, orderId: pi.id,
+          name:  pi.metadata.client_nom || 'Client',
+          items,
+          total: pi.amount / 100,
+          orderId: pi.id,
+          mrPoint,
         });
       } catch(e) { console.error('Erreur email :', e.message); }
     }
@@ -181,19 +198,56 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
   if (!safeAmount) return res.status(400).json({ error: 'Montant invalide' });
   if (!['eur'].includes(currency)) return res.status(400).json({ error: 'Devise non supportée' });
 
-  // Sanitiser les metadata
+  // ── Sanitiser TOUTES les metadata (client + produit + point relais) ─────────
   const safeMetadata = {};
-  ['client_nom','client_email','produit','nb_articles','livraison','items_json'].forEach(k => {
+  const metaKeys = [
+    'client_nom', 'client_email', 'produit', 'nb_articles', 'livraison', 'items_json',
+    'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
+  ];
+  metaKeys.forEach(k => {
     if (metadata[k]) safeMetadata[k] = sanitizeString(String(metadata[k]), 500);
   });
 
+  // ── Email client validé ────────────────────────────────────────────────────
+  const clientEmail = sanitizeEmail(metadata.client_email || '');
+  const clientNom   = sanitizeString(metadata.client_nom || '', 100);
+
+  // ── Résumé produits pour la description Stripe ────────────────────────────
+  const description = sanitizeString(metadata.produit || 'Commande L\'Atelier Souvenirs', 500);
+
   try {
+    // ── Créer ou retrouver le Customer Stripe ─────────────────────────────────
+    let customerId;
+    if (clientEmail) {
+      const existing = await stripe.customers.list({ email: clientEmail, limit: 1 });
+      if (existing.data.length > 0) {
+        customerId = existing.data[0].id;
+        // Mettre à jour le nom si vide
+        if (!existing.data[0].name && clientNom) {
+          await stripe.customers.update(customerId, { name: clientNom });
+        }
+      } else {
+        const customer = await stripe.customers.create({
+          name:  clientNom || undefined,
+          email: clientEmail,
+        });
+        customerId = customer.id;
+      }
+    }
+
     const pi = await stripe.paymentIntents.create({
-      amount: safeAmount, currency,
+      amount:   safeAmount,
+      currency,
       automatic_payment_methods: { enabled: true },
-      metadata: safeMetadata,
+      customer:      customerId || undefined,   // ← lie le Customer
+      receipt_email: clientEmail || undefined,  // ← envoie le reçu Stripe
+      description,                              // ← visible dans le dashboard
+      metadata: safeMetadata,                   // ← toutes les infos commande
     });
+
+    console.log(`💳 PaymentIntent créé : ${(safeAmount/100).toFixed(2)}€ — ${clientEmail || 'invité'} — ${description}`);
     res.json({ clientSecret: pi.client_secret });
+
   } catch (err) {
     console.error('Erreur PaymentIntent :', err.message);
     res.status(500).json({ error: 'Erreur lors de la création du paiement' });
@@ -204,12 +258,11 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
 app.post('/submit-review', reviewLimiter, async (req, res) => {
   const { rating, name, product, text, email, orderRef, photo } = req.body;
 
-  // Extraire et valider la photo
   let photoBuffer = null;
   let photoMime = null;
   if (photo && typeof photo === 'string' && photo.startsWith('data:image')) {
     const matches = photo.match(/^data:(image\/(jpeg|png|webp));base64,(.+)$/);
-    if (matches && matches[3].length < 7 * 1024 * 1024) { // max ~5Mo base64
+    if (matches && matches[3].length < 7 * 1024 * 1024) {
       photoMime = matches[1];
       photoBuffer = Buffer.from(matches[3], 'base64');
     }
