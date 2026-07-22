@@ -146,6 +146,40 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
   console.log(`📧 Email envoyé à ${email}`);
 }
 
+// ─── EMAIL DE RELANCE J+3 (demande d'avis) ───────────────────────────────────
+async function sendFollowupEmail({ email, name, orderId }) {
+  const mailer = createMailer();
+  if (!mailer) return console.log('⚠️ SMTP non configuré');
+
+  const safeName = sanitizeString(name, 100);
+  const safeId   = sanitizeString(orderId, 50);
+
+  await mailer.sendMail({
+    from: `"L'Atelier Souvenirs" <${process.env.SMTP_USER}>`,
+    to: email,
+    subject: `Comment se passe votre création ? 💌`,
+    html: `<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#faf8f5;font-family:Arial,sans-serif">
+<div style="max-width:560px;margin:0 auto;padding:32px 16px">
+  <div style="text-align:center;margin-bottom:32px">
+    <div style="font-size:22px;font-weight:700;color:#2c3e35">L'Atelier <span style="color:#e05a45;font-style:italic">Souvenirs</span></div>
+    <div style="font-size:12px;color:#7a7570;margin-top:4px">Création Hyéroise · Personnalisation instantanée</div>
+  </div>
+  <div style="background:#fff;border-radius:16px;padding:28px;text-align:center;border:1px solid #e8e4df;margin-bottom:16px">
+    <h1 style="font-size:20px;font-weight:700;color:#2c3e35;margin:0 0 8px">Bonjour ${safeName} 👋</h1>
+    <p style="font-size:14px;color:#7a7570;line-height:1.6;margin:0 0 20px">Votre création a normalement dû arriver ! On espère qu'elle vous plaît autant qu'à nous de l'avoir fabriquée.</p>
+    <p style="font-size:14px;color:#7a7570;line-height:1.6;margin:0 0 20px">Un petit mot de votre part nous aide énormément — et une photo de votre création est toujours la bienvenue 📸</p>
+    <a href="${process.env.FRONTEND_URL}/review.html" style="display:inline-block;background:#e05a45;color:#fff;text-decoration:none;padding:12px 28px;border-radius:10px;font-weight:600;font-size:14px">✍️ Laisser un avis</a>
+  </div>
+  <div style="text-align:center;font-size:11px;color:#7a7570;padding-top:16px">
+    <p>© 2026 L'Atelier Souvenirs · Création Hyéroise</p>
+    <p style="margin-top:4px">Réf. : #${safeId.slice(-8).toUpperCase()}</p>
+  </div>
+</div></body></html>`
+  });
+  console.log(`📧 Email de relance envoyé à ${email}`);
+}
+
 // ─── WEBHOOKS STRIPE (raw body — doit être AVANT express.json) ───────────────
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -308,6 +342,51 @@ app.post('/submit-review', reviewLimiter, async (req, res) => {
   res.json({ success: true });
 });
 
+// ─── RELANCE AUTOMATIQUE J+3 ──────────────────────────────────────────────────
+// À appeler une fois par jour (Render Cron Job, ou service externe type
+// cron-job.org) sur : POST /run-followups?key=VOTRE_CLE
+app.post('/run-followups', async (req, res) => {
+  if (!process.env.FOLLOWUP_SECRET || req.query.key !== process.env.FOLLOWUP_SECRET) {
+    return res.status(403).json({ error: 'Non autorisé' });
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const DAY = 24 * 60 * 60;
+  // Commandes payées il y a entre 3 et 4 jours, pas encore relancées
+  const gte = now - 4 * DAY;
+  const lte = now - 3 * DAY;
+
+  let sent = 0, checked = 0, errors = 0;
+  try {
+    const list = await stripe.paymentIntents.list({ created: { gte, lte }, limit: 100 });
+    for (const pi of list.data) {
+      checked++;
+      if (pi.status !== 'succeeded') continue;
+      if (pi.metadata.followup_sent === 'true') continue;
+      const clientEmail = sanitizeEmail(pi.metadata.client_email || '');
+      if (!clientEmail) continue;
+
+      try {
+        await sendFollowupEmail({
+          email: clientEmail,
+          name:  pi.metadata.client_nom || 'Client',
+          orderId: pi.id,
+        });
+        await stripe.paymentIntents.update(pi.id, { metadata: { followup_sent: 'true' } });
+        sent++;
+      } catch (e) {
+        console.error(`Erreur relance ${pi.id} :`, e.message);
+        errors++;
+      }
+    }
+    console.log(`🔁 Relances J+3 : ${sent} envoyée(s) / ${checked} commande(s) vérifiée(s)`);
+    res.json({ checked, sent, errors });
+  } catch (err) {
+    console.error('Erreur /run-followups :', err.message);
+    res.status(500).json({ error: 'Erreur lors du traitement des relances' });
+  }
+});
+
 // ─── SANTÉ ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: "L'Atelier Souvenirs API", secure: true });
@@ -325,5 +404,6 @@ app.listen(PORT, () => {
   console.log(`🚀 Serveur démarré sur le port ${PORT}`);
   console.log(`   Stripe   : ${process.env.STRIPE_SECRET_KEY ? '✅' : '❌'}`);
   console.log(`   SMTP     : ${process.env.SMTP_HOST ? '✅' : '⚠️  non configuré'}`);
+  console.log(`   Relances : ${process.env.FOLLOWUP_SECRET ? '✅ /run-followups actif' : '⚠️  FOLLOWUP_SECRET non défini'}`);
   console.log(`   Sécurité : ✅ Helmet + Rate Limiting + Sanitisation`);
 });
