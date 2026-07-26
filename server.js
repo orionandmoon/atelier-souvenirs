@@ -146,6 +146,46 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
   console.log(`📧 Email envoyé à ${email}`);
 }
 
+// ─── NOTIFICATION PROPRIÉTAIRE (nouvelle commande) ───────────────────────────
+async function sendOwnerOrderNotification({ items, total, orderId, name, email, mrPoint, codePromo }) {
+  const mailer = createMailer();
+  if (!mailer || !process.env.OWNER_EMAIL) return;
+
+  const safeName  = sanitizeString(name, 100);
+  const safeId    = sanitizeString(orderId, 50);
+  const itemsHtml = items.map(i => `
+    <tr>
+      <td style="padding:6px 10px;border-bottom:1px solid #eee">${sanitizeString(i.name, 100)}</td>
+      <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:center">×${sanitizeNumber(i.quantity,1,99)||1}</td>
+      <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right">${(parseFloat(i.price)*parseInt(i.quantity)).toFixed(2)} €</td>
+    </tr>`).join('');
+
+  try {
+    await mailer.sendMail({
+      from: `"L'Atelier Souvenirs" <${process.env.SMTP_USER}>`,
+      to: process.env.OWNER_EMAIL,
+      subject: `🛒 Nouvelle commande — ${parseFloat(total).toFixed(2)} €${codePromo ? ` (code ${codePromo})` : ''}`,
+      html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px">
+        <h2 style="color:#2c3e35">Nouvelle commande reçue !</h2>
+        <div style="background:#faf8f5;border-radius:12px;padding:20px;margin:16px 0">
+          <p style="margin:0 0 8px"><strong>${safeName}</strong>${email ? ` — ${sanitizeString(email,150)}` : ''}</p>
+          <table style="width:100%;border-collapse:collapse;margin:10px 0">
+            <tbody>${itemsHtml}</tbody>
+            <tfoot><tr>
+              <td colspan="2" style="padding:8px 10px;font-weight:700">Total</td>
+              <td style="padding:8px 10px;font-weight:700;text-align:right">${parseFloat(total).toFixed(2)} €</td>
+            </tr></tfoot>
+          </table>
+          ${codePromo ? `<p style="font-size:13px;color:#c49a3c;margin:8px 0 0">🏷️ Code promo utilisé : <strong>${sanitizeString(codePromo,50)}</strong></p>` : ''}
+          ${mrPoint ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">📍 Relais : ${sanitizeString(mrPoint.nom,100)} — ${sanitizeString(mrPoint.ville,100)}</p>` : ''}
+          <p style="font-size:12px;color:#7a7570;margin-top:12px">Réf. : #${safeId.slice(-8).toUpperCase()}</p>
+        </div>
+      </div>`
+    });
+    console.log(`📧 Notification commande envoyée au propriétaire`);
+  } catch(e) { console.error('Erreur notification propriétaire :', e.message); }
+}
+
 // ─── EMAIL DE RELANCE J+3 (demande d'avis) ───────────────────────────────────
 async function sendFollowupEmail({ email, name, orderId }) {
   const mailer = createMailer();
@@ -197,6 +237,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     console.log(`   Client  : ${pi.metadata.client_nom || 'N/A'}`);
     console.log(`   Produit : ${pi.metadata.produit || 'N/A'}`);
     console.log(`   Relais  : ${pi.metadata.mr_point_nom || 'N/A'} — ${pi.metadata.mr_point_ville || 'N/A'}`);
+    if (pi.metadata.code_promo) console.log(`   Code    : ${pi.metadata.code_promo}`);
 
     if (clientEmail) {
       try {
@@ -214,6 +255,15 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           total: pi.amount / 100,
           orderId: pi.id,
           mrPoint,
+        });
+        await sendOwnerOrderNotification({
+          items,
+          total: pi.amount / 100,
+          orderId: pi.id,
+          name: pi.metadata.client_nom || 'Client',
+          email: clientEmail,
+          mrPoint,
+          codePromo: pi.metadata.code_promo || '',
         });
       } catch(e) { console.error('Erreur email :', e.message); }
     }
@@ -237,6 +287,7 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
   const metaKeys = [
     'client_nom', 'client_email', 'produit', 'nb_articles', 'livraison', 'items_json',
     'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
+    'code_promo',
   ];
   metaKeys.forEach(k => {
     if (metadata[k]) safeMetadata[k] = sanitizeString(String(metadata[k]), 500);
