@@ -331,11 +331,42 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
     });
 
     console.log(`💳 PaymentIntent créé : ${(safeAmount/100).toFixed(2)}€ — ${clientEmail || 'invité'} — ${description}`);
-    res.json({ clientSecret: pi.client_secret });
+    res.json({ clientSecret: pi.client_secret, paymentIntentId: pi.id });
 
   } catch (err) {
     console.error('Erreur PaymentIntent :', err.message);
     res.status(500).json({ error: 'Erreur lors de la création du paiement' });
+  }
+});
+
+// ─── MISE À JOUR MONTANT (code promo appliqué après création du paiement) ────
+app.post('/update-payment-intent', stripeLimiter, async (req, res) => {
+  const { paymentIntentId, amount, codePromo } = req.body;
+
+  const safeAmount = sanitizeNumber(amount, 50, 999900);
+  if (!safeAmount) return res.status(400).json({ error: 'Montant invalide' });
+  if (!paymentIntentId || typeof paymentIntentId !== 'string' || !paymentIntentId.startsWith('pi_')) {
+    return res.status(400).json({ error: 'Identifiant de paiement invalide' });
+  }
+
+  try {
+    // On vérifie que le paiement n'est pas déjà confirmé avant de le modifier
+    const existing = await stripe.paymentIntents.retrieve(paymentIntentId);
+    if (existing.status !== 'requires_payment_method' && existing.status !== 'requires_confirmation') {
+      return res.status(400).json({ error: 'Ce paiement ne peut plus être modifié' });
+    }
+
+    const updateData = { amount: safeAmount };
+    if (codePromo) {
+      updateData.metadata = { ...existing.metadata, code_promo: sanitizeString(String(codePromo), 500) };
+    }
+
+    const updated = await stripe.paymentIntents.update(paymentIntentId, updateData);
+    console.log(`🔄 PaymentIntent mis à jour : ${(safeAmount/100).toFixed(2)}€${codePromo ? ` (code ${codePromo})` : ''}`);
+    res.json({ success: true, amount: updated.amount });
+  } catch (err) {
+    console.error('Erreur update PaymentIntent :', err.message);
+    res.status(500).json({ error: 'Erreur lors de la mise à jour du paiement' });
   }
 });
 
