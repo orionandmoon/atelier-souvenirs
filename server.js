@@ -323,7 +323,7 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
     const pi = await stripe.paymentIntents.create({
       amount:   safeAmount,
       currency,
-      automatic_payment_methods: { enabled: true },
+      payment_method_types: ['card'], // uniquement carte bancaire (pas de Klarna, Amazon Pay, etc.)
       customer:      customerId || undefined,   // ← lie le Customer
       receipt_email: clientEmail || undefined,  // ← envoie le reçu Stripe
       description,                              // ← visible dans le dashboard
