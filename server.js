@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express    = require('express');
 const cors       = require('cors');
+const crypto     = require('crypto');
 const stripe     = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const nodemailer = require('nodemailer');
 const rateLimit  = require('express-rate-limit');
@@ -147,7 +148,7 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
 }
 
 // ─── NOTIFICATION PROPRIÉTAIRE (nouvelle commande) ───────────────────────────
-async function sendOwnerOrderNotification({ items, total, orderId, name, email, mrPoint, codePromo }) {
+async function sendOwnerOrderNotification({ items, total, orderId, name, email, mrPoint, codePromo, attachments = [] }) {
   const mailer = createMailer();
   if (!mailer || !process.env.OWNER_EMAIL) return;
 
@@ -178,9 +179,11 @@ async function sendOwnerOrderNotification({ items, total, orderId, name, email, 
           </table>
           ${codePromo ? `<p style="font-size:13px;color:#c49a3c;margin:8px 0 0">🏷️ Code promo utilisé : <strong>${sanitizeString(codePromo,50)}</strong></p>` : ''}
           ${mrPoint ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">📍 Relais : ${sanitizeString(mrPoint.nom,100)} — ${sanitizeString(mrPoint.ville,100)}</p>` : ''}
+          ${attachments.length ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">🖼️ ${attachments.length} photo(s) client jointe(s) à cet email</p>` : '<p style="font-size:13px;color:#b91c1c;margin:8px 0 0">⚠️ Aucune photo jointe — commande sans personnalisation image, ou photo non reçue</p>'}
           <p style="font-size:12px;color:#7a7570;margin-top:12px">Réf. : #${safeId.slice(-8).toUpperCase()}</p>
         </div>
-      </div>`
+      </div>`,
+      attachments,
     });
     console.log(`📧 Notification commande envoyée au propriétaire`);
   } catch(e) { console.error('Erreur notification propriétaire :', e.message); }
@@ -248,6 +251,19 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           cp:      pi.metadata.mr_point_cp,
           ville:   pi.metadata.mr_point_ville,
         } : null;
+
+        // Récupère les photos client stockées temporairement (si l'ID existe encore)
+        const photoIds = (pi.metadata.photo_ids || '').split(',').map(s => s.trim()).filter(Boolean);
+        const attachments = photoIds
+          .map(id => photoStore.get(id))
+          .filter(Boolean)
+          .map((entry, i) => ({
+            filename: `photo-client-${i + 1}.${entry.mimeType.split('/')[1]}`,
+            content: entry.data,
+            encoding: 'base64',
+          }));
+        photoIds.forEach(id => photoStore.delete(id)); // nettoyage une fois utilisées
+
         await sendOrderConfirmationEmail({
           email: clientEmail,
           name:  pi.metadata.client_nom || 'Client',
@@ -264,11 +280,53 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           email: clientEmail,
           mrPoint,
           codePromo: pi.metadata.code_promo || '',
+          attachments,
         });
       } catch(e) { console.error('Erreur email :', e.message); }
     }
   }
   res.json({ received: true });
+});
+
+// ─── PHOTOS CLIENT (stockage temporaire en mémoire) ───────────────────────────
+// Les photos uploadées lors de la personnalisation sont gardées en mémoire le
+// temps que la commande se finalise (elles ne peuvent pas transiter par les
+// metadata Stripe, limitées à 500 caractères par champ). Nettoyage automatique
+// après 3h pour éviter toute accumulation si une commande n'aboutit jamais.
+const photoStore = new Map(); // photoId -> { data, mimeType, createdAt }
+const PHOTO_TTL_MS = 3 * 60 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of photoStore) {
+    if (now - entry.createdAt > PHOTO_TTL_MS) photoStore.delete(id);
+  }
+}, 30 * 60 * 1000);
+
+const photoUploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 40,
+  message: { error: 'Trop d\'envois de photos, réessayez dans quelques minutes.' },
+});
+
+app.post('/upload-photo', photoUploadLimiter, express.json({ limit: '12mb' }), (req, res) => {
+  const { imageDataUrl } = req.body;
+  if (!imageDataUrl || typeof imageDataUrl !== 'string') {
+    return res.status(400).json({ error: 'Image manquante' });
+  }
+  const match = imageDataUrl.match(/^data:(image\/(png|jpeg|jpg|webp));base64,(.+)$/);
+  if (!match) return res.status(400).json({ error: 'Format d\'image invalide' });
+
+  const mimeType = match[1];
+  const base64Data = match[3];
+  const sizeBytes = Math.ceil((base64Data.length * 3) / 4);
+  if (sizeBytes > 10 * 1024 * 1024) {
+    return res.status(400).json({ error: 'Image trop lourde (max 10 Mo)' });
+  }
+
+  const photoId = crypto.randomUUID();
+  photoStore.set(photoId, { data: base64Data, mimeType, createdAt: Date.now() });
+  console.log(`🖼️  Photo reçue et stockée temporairement : ${photoId} (${(sizeBytes/1024).toFixed(0)} Ko)`);
+  res.json({ photoId });
 });
 
 // ─── JSON (limite taille body à 10kb) ────────────────────────────────────────
@@ -287,7 +345,7 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
   const metaKeys = [
     'client_nom', 'client_email', 'produit', 'nb_articles', 'livraison', 'items_json',
     'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
-    'code_promo',
+    'code_promo', 'photo_ids',
   ];
   metaKeys.forEach(k => {
     if (metadata[k]) safeMetadata[k] = sanitizeString(String(metadata[k]), 500);
@@ -341,13 +399,30 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
 
 // ─── MISE À JOUR MONTANT (code promo appliqué après création du paiement) ────
 app.post('/update-payment-intent', stripeLimiter, async (req, res) => {
-  const { paymentIntentId, amount, codePromo } = req.body;
+  const { paymentIntentId, amount, metadata = {} } = req.body;
 
-  const safeAmount = sanitizeNumber(amount, 50, 999900);
-  if (!safeAmount) return res.status(400).json({ error: 'Montant invalide' });
   if (!paymentIntentId || typeof paymentIntentId !== 'string' || !paymentIntentId.startsWith('pi_')) {
     return res.status(400).json({ error: 'Identifiant de paiement invalide' });
   }
+
+  // Amount optionnel — on ne le valide/change que s'il est fourni
+  let safeAmount;
+  if (amount !== undefined) {
+    safeAmount = sanitizeNumber(amount, 50, 999900);
+    if (!safeAmount) return res.status(400).json({ error: 'Montant invalide' });
+  }
+
+  const metaKeys = [
+    'client_nom', 'client_email', 'produit', 'nb_articles', 'livraison', 'items_json',
+    'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
+    'code_promo', 'photo_ids',
+  ];
+  const safeMetadata = {};
+  metaKeys.forEach(k => {
+    if (metadata[k]) safeMetadata[k] = sanitizeString(String(metadata[k]), 500);
+  });
+
+  const clientEmail = sanitizeEmail(metadata.client_email || '');
 
   try {
     // On vérifie que le paiement n'est pas déjà confirmé avant de le modifier
@@ -356,13 +431,13 @@ app.post('/update-payment-intent', stripeLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Ce paiement ne peut plus être modifié' });
     }
 
-    const updateData = { amount: safeAmount };
-    if (codePromo) {
-      updateData.metadata = { ...existing.metadata, code_promo: sanitizeString(String(codePromo), 500) };
-    }
+    const updateData = {};
+    if (safeAmount !== undefined) updateData.amount = safeAmount;
+    if (Object.keys(safeMetadata).length) updateData.metadata = { ...existing.metadata, ...safeMetadata };
+    if (clientEmail) updateData.receipt_email = clientEmail;
 
     const updated = await stripe.paymentIntents.update(paymentIntentId, updateData);
-    console.log(`🔄 PaymentIntent mis à jour : ${(safeAmount/100).toFixed(2)}€${codePromo ? ` (code ${codePromo})` : ''}`);
+    console.log(`🔄 PaymentIntent mis à jour${safeAmount !== undefined ? ` : ${(safeAmount/100).toFixed(2)}€` : ''}${clientEmail ? ` — ${clientEmail}` : ''}`);
     res.json({ success: true, amount: updated.amount });
   } catch (err) {
     console.error('Erreur update PaymentIntent :', err.message);
