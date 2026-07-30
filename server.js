@@ -20,6 +20,7 @@ const ALLOWED_ORIGINS = [
   process.env.FRONTEND_URL,
   'https://lateliersouvenirs.fr',
   'https://www.lateliersouvenirs.fr',
+  'https://lateliersouvenirs.pages.dev',
   'http://localhost:5500',
   'http://127.0.0.1:5500',
 ].filter(Boolean);
@@ -54,6 +55,20 @@ function sanitizeString(str, maxLen = 500) {
     .replace(/<[^>]*>/g, '')
     .replace(/[<>"'`;]/g, '')
     .replace(/[\x00-\x1F\x7F]/g, '');
+}
+
+// items_json a besoin de ses guillemets pour rester du JSON valide —
+// sanitizeString les détruirait. On valide la structure autrement :
+// on parse, on vérifie que c'est bien un tableau, on re-sérialise proprement.
+function sanitizeItemsJson(str) {
+  if (typeof str !== 'string') return '';
+  try {
+    const parsed = JSON.parse(str.trim().slice(0, 3000));
+    if (!Array.isArray(parsed)) return '';
+    return JSON.stringify(parsed.slice(0, 50)); // borne raisonnable du nombre d'articles
+  } catch {
+    return '';
+  }
 }
 
 function sanitizeEmail(email) {
@@ -348,7 +363,10 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
     'code_promo', 'photo_ids',
   ];
   metaKeys.forEach(k => {
-    if (metadata[k]) safeMetadata[k] = sanitizeString(String(metadata[k]), 500);
+    if (!metadata[k]) return;
+    safeMetadata[k] = k === 'items_json'
+      ? sanitizeItemsJson(String(metadata[k]))
+      : sanitizeString(String(metadata[k]), 500);
   });
 
   // ── Email client validé ────────────────────────────────────────────────────
@@ -419,7 +437,10 @@ app.post('/update-payment-intent', stripeLimiter, async (req, res) => {
   ];
   const safeMetadata = {};
   metaKeys.forEach(k => {
-    if (metadata[k]) safeMetadata[k] = sanitizeString(String(metadata[k]), 500);
+    if (!metadata[k]) return;
+    safeMetadata[k] = k === 'items_json'
+      ? sanitizeItemsJson(String(metadata[k]))
+      : sanitizeString(String(metadata[k]), 500);
   });
 
   const clientEmail = sanitizeEmail(metadata.client_email || '');
