@@ -3,7 +3,7 @@ const express    = require('express');
 const cors       = require('cors');
 const crypto     = require('crypto');
 const stripe     = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const nodemailer = require('nodemailer');
+const https = require('https');
 const rateLimit  = require('express-rate-limit');
 const helmet     = require('helmet');
 
@@ -84,26 +84,46 @@ function sanitizeNumber(val, min, max) {
 
 const VALID_PRODUCTS = ['Coque de téléphone', 'Magnet frigo', 'Puzzle A4'];
 
-// ─── MAILER ───────────────────────────────────────────────────────────────────
-function createMailer() {
-  if (!process.env.SMTP_HOST) return null;
-  return nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: parseInt(process.env.SMTP_PORT || '587'),
-    secure: process.env.SMTP_SECURE === 'true',
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    pool: true,               // réutilise les connexions au lieu d'en ouvrir une par email
-    maxConnections: 3,
-    connectionTimeout: 20000, // échoue en 20s au lieu de rester bloqué 1-2 minutes
-    greetingTimeout: 10000,
-    socketTimeout: 15000,
+// ─── MAILER (via l'API Resend en HTTPS — le SMTP sortant est bloqué sur Render gratuit) ─
+function sendEmailResend({ to, subject, html, attachments = [] }) {
+  return new Promise((resolve, reject) => {
+    if (!process.env.RESEND_API_KEY) {
+      console.log('⚠️ RESEND_API_KEY non configurée');
+      return resolve(null);
+    }
+    const payload = JSON.stringify({
+      from: process.env.RESEND_FROM || "L'Atelier Souvenirs <onboarding@resend.dev>",
+      to: [to],
+      subject,
+      html,
+      attachments: attachments.map(a => ({ filename: a.filename, content: a.content })),
+    });
+    const req = https.request({
+      hostname: 'api.resend.com',
+      path: '/emails',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 15000,
+    }, (res) => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) resolve(JSON.parse(body || '{}'));
+        else reject(new Error(`Resend ${res.statusCode} : ${body}`));
+      });
+    });
+    req.on('timeout', () => { req.destroy(); reject(new Error('Resend : délai de connexion dépassé')); });
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
   });
 }
 
 async function sendOrderConfirmationEmail({ email, name, items, total, orderId, mrPoint }) {
-  const mailer = createMailer();
-  if (!mailer) return console.log('⚠️ SMTP non configuré');
-
   const safeName = sanitizeString(name, 100);
   const safeId   = sanitizeString(orderId, 50);
   const itemsHtml = items.map(i => `
@@ -120,8 +140,7 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
       ${sanitizeString(mrPoint.adresse, 200)}, ${sanitizeString(mrPoint.cp, 10)} ${sanitizeString(mrPoint.ville, 100)}
     </div>` : '';
 
-  await mailer.sendMail({
-    from: `"L'Atelier Souvenirs" <${process.env.SMTP_USER}>`,
+  await sendEmailResend({
     to: email,
     subject: `✅ Commande confirmée — L'Atelier Souvenirs`,
     html: `<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"></head>
@@ -169,8 +188,7 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
 
 // ─── NOTIFICATION PROPRIÉTAIRE (nouvelle commande) ───────────────────────────
 async function sendOwnerOrderNotification({ items, total, orderId, name, email, mrPoint, codePromo, attachments = [] }) {
-  const mailer = createMailer();
-  if (!mailer || !process.env.OWNER_EMAIL) return;
+  if (!process.env.OWNER_EMAIL) return;
 
   const safeName  = sanitizeString(name, 100);
   const safeId    = sanitizeString(orderId, 50);
@@ -182,8 +200,7 @@ async function sendOwnerOrderNotification({ items, total, orderId, name, email, 
     </tr>`).join('');
 
   try {
-    await mailer.sendMail({
-      from: `"L'Atelier Souvenirs" <${process.env.SMTP_USER}>`,
+    await sendEmailResend({
       to: process.env.OWNER_EMAIL,
       subject: `🛒 Nouvelle commande — ${parseFloat(total).toFixed(2)} €${codePromo ? ` (code ${codePromo})` : ''}`,
       html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px">
@@ -211,14 +228,10 @@ async function sendOwnerOrderNotification({ items, total, orderId, name, email, 
 
 // ─── EMAIL DE RELANCE J+3 (demande d'avis) ───────────────────────────────────
 async function sendFollowupEmail({ email, name, orderId }) {
-  const mailer = createMailer();
-  if (!mailer) return console.log('⚠️ SMTP non configuré');
-
   const safeName = sanitizeString(name, 100);
   const safeId   = sanitizeString(orderId, 50);
 
-  await mailer.sendMail({
-    from: `"L'Atelier Souvenirs" <${process.env.SMTP_USER}>`,
+  await sendEmailResend({
     to: email,
     subject: `Comment se passe votre création ? 💌`,
     html: `<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"></head>
@@ -516,12 +529,10 @@ app.post('/submit-review', reviewLimiter, async (req, res) => {
 
   console.log(`⭐ Avis reçu : ${safeRating}/5 — ${safeName} — ${safeProduct}`);
 
-  const mailer = createMailer();
-  if (mailer && process.env.OWNER_EMAIL) {
+  if (process.env.OWNER_EMAIL) {
     try {
       const stars = '★'.repeat(safeRating) + '☆'.repeat(5 - safeRating);
-      await mailer.sendMail({
-        from: `"L'Atelier Souvenirs" <${process.env.SMTP_USER}>`,
+      await sendEmailResend({
         to: process.env.OWNER_EMAIL,
         subject: `⭐ Nouvel avis — ${stars} — ${safeName}`,
         html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px">
@@ -587,29 +598,27 @@ app.post('/run-followups', async (req, res) => {
   }
 });
 
-// ─── DIAGNOSTIC SMTP ──────────────────────────────────────────────────────────
-// Teste la connexion SMTP indépendamment d'une vraie commande, pour obtenir
-// le message d'erreur réseau précis (au lieu du "Connection timeout" générique
-// qui remonte dans les emails de commande). Protégé par la même clé que
+// ─── DIAGNOSTIC EMAIL ─────────────────────────────────────────────────────────
+// Envoie un vrai email de test à OWNER_EMAIL via Resend, pour vérifier la
+// configuration indépendamment d'une commande. Protégé par la même clé que
 // /run-followups pour éviter les abus.
-app.get('/test-smtp', async (req, res) => {
+app.get('/test-email', async (req, res) => {
   if (!process.env.FOLLOWUP_SECRET || req.query.key !== process.env.FOLLOWUP_SECRET) {
     return res.status(403).json({ error: 'Non autorisé' });
   }
-  const mailer = createMailer();
-  if (!mailer) return res.status(500).json({ error: 'SMTP non configuré (SMTP_HOST manquant)' });
+  if (!process.env.RESEND_API_KEY) return res.status(500).json({ error: 'RESEND_API_KEY manquante' });
+  if (!process.env.OWNER_EMAIL) return res.status(500).json({ error: 'OWNER_EMAIL manquante' });
 
   const started = Date.now();
   try {
-    await mailer.verify();
-    res.json({ ok: true, tempsMs: Date.now() - started });
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      tempsMs: Date.now() - started,
-      erreur: err.message,
-      code: err.code || null,
+    const result = await sendEmailResend({
+      to: process.env.OWNER_EMAIL,
+      subject: '🧪 Test email — L\'Atelier Souvenirs',
+      html: '<p>Si tu reçois ceci, l\'envoi via Resend fonctionne correctement.</p>',
     });
+    res.json({ ok: true, tempsMs: Date.now() - started, result });
+  } catch (err) {
+    res.status(500).json({ ok: false, tempsMs: Date.now() - started, erreur: err.message });
   }
 });
 
@@ -629,7 +638,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Serveur démarré sur le port ${PORT}`);
   console.log(`   Stripe   : ${process.env.STRIPE_SECRET_KEY ? '✅' : '❌'}`);
-  console.log(`   SMTP     : ${process.env.SMTP_HOST ? '✅' : '⚠️  non configuré'}`);
+  console.log(`   Email    : ${process.env.RESEND_API_KEY ? '✅ Resend' : '⚠️  RESEND_API_KEY non configurée'}`);
   console.log(`   Relances : ${process.env.FOLLOWUP_SECRET ? '✅ /run-followups actif' : '⚠️  FOLLOWUP_SECRET non défini'}`);
   console.log(`   Sécurité : ✅ Helmet + Rate Limiting + Sanitisation`);
 });
