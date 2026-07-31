@@ -94,7 +94,7 @@ function createMailer() {
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
     pool: true,               // réutilise les connexions au lieu d'en ouvrir une par email
     maxConnections: 3,
-    connectionTimeout: 10000, // échoue en 10s au lieu de rester bloqué 1-2 minutes
+    connectionTimeout: 20000, // échoue en 20s au lieu de rester bloqué 1-2 minutes
     greetingTimeout: 10000,
     socketTimeout: 15000,
   });
@@ -584,6 +584,32 @@ app.post('/run-followups', async (req, res) => {
   } catch (err) {
     console.error('Erreur /run-followups :', err.message);
     res.status(500).json({ error: 'Erreur lors du traitement des relances' });
+  }
+});
+
+// ─── DIAGNOSTIC SMTP ──────────────────────────────────────────────────────────
+// Teste la connexion SMTP indépendamment d'une vraie commande, pour obtenir
+// le message d'erreur réseau précis (au lieu du "Connection timeout" générique
+// qui remonte dans les emails de commande). Protégé par la même clé que
+// /run-followups pour éviter les abus.
+app.get('/test-smtp', async (req, res) => {
+  if (!process.env.FOLLOWUP_SECRET || req.query.key !== process.env.FOLLOWUP_SECRET) {
+    return res.status(403).json({ error: 'Non autorisé' });
+  }
+  const mailer = createMailer();
+  if (!mailer) return res.status(500).json({ error: 'SMTP non configuré (SMTP_HOST manquant)' });
+
+  const started = Date.now();
+  try {
+    await mailer.verify();
+    res.json({ ok: true, tempsMs: Date.now() - started });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      tempsMs: Date.now() - started,
+      erreur: err.message,
+      code: err.code || null,
+    });
   }
 });
 
