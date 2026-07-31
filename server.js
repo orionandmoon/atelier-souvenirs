@@ -92,6 +92,11 @@ function createMailer() {
     port: parseInt(process.env.SMTP_PORT || '587'),
     secure: process.env.SMTP_SECURE === 'true',
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    pool: true,               // réutilise les connexions au lieu d'en ouvrir une par email
+    maxConnections: 3,
+    connectionTimeout: 10000, // échoue en 10s au lieu de rester bloqué 1-2 minutes
+    greetingTimeout: 10000,
+    socketTimeout: 15000,
   });
 }
 
@@ -239,6 +244,11 @@ async function sendFollowupEmail({ email, name, orderId }) {
 }
 
 // ─── WEBHOOKS STRIPE (raw body — doit être AVANT express.json) ───────────────
+// Anti-doublon : Stripe peut renvoyer le même événement plusieurs fois
+// (retry automatique si la réponse tarde). On garde en mémoire les
+// commandes déjà traitées pour ne jamais envoyer les emails deux fois.
+const processedOrders = new Set();
+
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -248,8 +258,21 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // ── On répond à Stripe TOUT DE SUITE, avant l'envoi des emails ──────────────
+  // Sinon, si l'envoi SMTP est lent (instance qui se réveille, Gmail lent...),
+  // Stripe considère que le webhook a échoué et renvoie le même événement,
+  // ce qui déclenche un envoi en double (et sature les connexions SMTP).
+  res.json({ received: true });
+
   if (event.type === 'payment_intent.succeeded') {
     const pi = event.data.object;
+
+    if (processedOrders.has(pi.id)) {
+      console.log(`↪️  Commande ${pi.id} déjà traitée, événement ignoré (doublon Stripe)`);
+      return;
+    }
+    processedOrders.add(pi.id);
+
     const clientEmail = sanitizeEmail(pi.metadata.client_email || '');
     console.log(`✅ Paiement reçu : ${(pi.amount/100).toFixed(2)}€ — ${clientEmail || 'N/A'}`);
     console.log(`   Client  : ${pi.metadata.client_nom || 'N/A'}`);
@@ -300,7 +323,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       } catch(e) { console.error('Erreur email :', e.message); }
     }
   }
-  res.json({ received: true });
 });
 
 // ─── PHOTOS CLIENT (stockage temporaire en mémoire) ───────────────────────────
