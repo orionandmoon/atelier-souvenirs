@@ -83,6 +83,10 @@ function sanitizeNumber(val, min, max) {
 }
 
 const VALID_PRODUCTS = ['Coque de téléphone', 'Magnet frigo', 'Puzzle A4'];
+const COUNTRY_NAMES = {
+  FR: 'France', BE: 'Belgique', LU: 'Luxembourg', ES: 'Espagne',
+  PT: 'Portugal', DE: 'Allemagne', IT: 'Italie', AT: 'Autriche', CH: 'Suisse',
+};
 
 // ─── MAILER (via l'API Resend en HTTPS — le SMTP sortant est bloqué sur Render gratuit) ─
 function sendEmailResend({ to, subject, html, attachments = [] }) {
@@ -123,7 +127,7 @@ function sendEmailResend({ to, subject, html, attachments = [] }) {
   });
 }
 
-async function sendOrderConfirmationEmail({ email, name, items, total, orderId, mrPoint }) {
+async function sendOrderConfirmationEmail({ email, name, items, total, orderId, mrPoint, homeAddress }) {
   const safeName = sanitizeString(name, 100);
   const safeId   = sanitizeString(orderId, 50);
   const itemsHtml = items.map(i => `
@@ -138,6 +142,11 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
       📍 <strong>Point relais Mondial Relay</strong><br>
       ${sanitizeString(mrPoint.nom, 100)}<br>
       ${sanitizeString(mrPoint.adresse, 200)}, ${sanitizeString(mrPoint.cp, 10)} ${sanitizeString(mrPoint.ville, 100)}
+    </div>` : homeAddress ? `
+    <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:10px;padding:16px;margin-top:12px;font-size:13px;color:#2c3e35">
+      📦 <strong>Livraison à domicile (Colissimo)</strong><br>
+      ${sanitizeString(homeAddress.street, 200)}<br>
+      ${sanitizeString(homeAddress.cp, 10)} ${sanitizeString(homeAddress.ville, 100)}, ${sanitizeString(COUNTRY_NAMES[homeAddress.pays] || homeAddress.pays, 50)}
     </div>` : '';
 
   await sendEmailResend({
@@ -187,7 +196,7 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
 }
 
 // ─── NOTIFICATION PROPRIÉTAIRE (nouvelle commande) ───────────────────────────
-async function sendOwnerOrderNotification({ items, total, orderId, name, email, mrPoint, codePromo, attachments = [] }) {
+async function sendOwnerOrderNotification({ items, total, orderId, name, email, mrPoint, homeAddress, codePromo, attachments = [] }) {
   if (!process.env.OWNER_EMAIL) return;
 
   const safeName  = sanitizeString(name, 100);
@@ -215,7 +224,7 @@ async function sendOwnerOrderNotification({ items, total, orderId, name, email, 
             </tr></tfoot>
           </table>
           ${codePromo ? `<p style="font-size:13px;color:#c49a3c;margin:8px 0 0">🏷️ Code promo utilisé : <strong>${sanitizeString(codePromo,50)}</strong></p>` : ''}
-          ${mrPoint ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">📍 Relais : ${sanitizeString(mrPoint.nom,100)} — ${sanitizeString(mrPoint.ville,100)}</p>` : ''}
+          ${mrPoint ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">📍 Relais : ${sanitizeString(mrPoint.nom,100)} — ${sanitizeString(mrPoint.ville,100)}</p>` : homeAddress ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">📦 Domicile : ${sanitizeString(homeAddress.street,200)}, ${sanitizeString(homeAddress.cp,10)} ${sanitizeString(homeAddress.ville,100)}, ${sanitizeString(COUNTRY_NAMES[homeAddress.pays] || homeAddress.pays,50)}</p>` : ''}
           ${attachments.length ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">🖼️ ${attachments.length} photo(s) client jointe(s) à cet email</p>` : '<p style="font-size:13px;color:#b91c1c;margin:8px 0 0">⚠️ Aucune photo jointe — commande sans personnalisation image, ou photo non reçue</p>'}
           <p style="font-size:12px;color:#7a7570;margin-top:12px">Réf. : #${safeId.slice(-8).toUpperCase()}</p>
         </div>
@@ -290,7 +299,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     console.log(`✅ Paiement reçu : ${(pi.amount/100).toFixed(2)}€ — ${clientEmail || 'N/A'}`);
     console.log(`   Client  : ${pi.metadata.client_nom || 'N/A'}`);
     console.log(`   Produit : ${pi.metadata.produit || 'N/A'}`);
+    console.log(`   Pays    : ${COUNTRY_NAMES[pi.metadata.pays] || pi.metadata.pays || 'N/A'}`);
     console.log(`   Relais  : ${pi.metadata.mr_point_nom || 'N/A'} — ${pi.metadata.mr_point_ville || 'N/A'}`);
+    if (pi.metadata.home_street) console.log(`   Domicile: ${pi.metadata.home_street}, ${pi.metadata.home_cp} ${pi.metadata.home_ville}`);
     if (pi.metadata.code_promo) console.log(`   Code    : ${pi.metadata.code_promo}`);
 
     if (clientEmail) {
@@ -301,6 +312,12 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           adresse: pi.metadata.mr_point_adr,
           cp:      pi.metadata.mr_point_cp,
           ville:   pi.metadata.mr_point_ville,
+        } : null;
+        const homeAddress = pi.metadata.home_street ? {
+          street: pi.metadata.home_street,
+          cp:     pi.metadata.home_cp,
+          ville:  pi.metadata.home_ville,
+          pays:   pi.metadata.pays,
         } : null;
 
         // Récupère les photos client stockées temporairement (si l'ID existe encore)
@@ -322,6 +339,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           total: pi.amount / 100,
           orderId: pi.id,
           mrPoint,
+          homeAddress,
         });
         await sendOwnerOrderNotification({
           items,
@@ -330,6 +348,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           name: pi.metadata.client_nom || 'Client',
           email: clientEmail,
           mrPoint,
+          homeAddress,
           codePromo: pi.metadata.code_promo || '',
           attachments,
         });
@@ -394,7 +413,8 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
   const safeMetadata = {};
   const metaKeys = [
     'client_nom', 'client_email', 'produit', 'nb_articles', 'livraison', 'items_json',
-    'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
+    'pays', 'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
+    'home_street', 'home_cp', 'home_ville',
     'code_promo', 'photo_ids',
   ];
   metaKeys.forEach(k => {
@@ -467,7 +487,8 @@ app.post('/update-payment-intent', stripeLimiter, async (req, res) => {
 
   const metaKeys = [
     'client_nom', 'client_email', 'produit', 'nb_articles', 'livraison', 'items_json',
-    'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
+    'pays', 'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
+    'home_street', 'home_cp', 'home_ville',
     'code_promo', 'photo_ids',
   ];
   const safeMetadata = {};
