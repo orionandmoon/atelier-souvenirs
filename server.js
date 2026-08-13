@@ -196,7 +196,7 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
 }
 
 // ─── NOTIFICATION PROPRIÉTAIRE (nouvelle commande) ───────────────────────────
-async function sendOwnerOrderNotification({ items, total, orderId, name, email, mrPoint, homeAddress, codePromo, attachments = [] }) {
+async function sendOwnerOrderNotification({ items, total, orderId, name, email, phone, mrPoint, homeAddress, codePromo, attachments = [] }) {
   if (!process.env.OWNER_EMAIL) return;
 
   const safeName  = sanitizeString(name, 100);
@@ -215,7 +215,7 @@ async function sendOwnerOrderNotification({ items, total, orderId, name, email, 
       html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px">
         <h2 style="color:#2c3e35">Nouvelle commande reçue !</h2>
         <div style="background:#faf8f5;border-radius:12px;padding:20px;margin:16px 0">
-          <p style="margin:0 0 8px"><strong>${safeName}</strong>${email ? ` — ${sanitizeString(email,150)}` : ''}</p>
+          <p style="margin:0 0 8px"><strong>${safeName}</strong>${email ? ` — ${sanitizeString(email,150)}` : ''}${phone ? ` — 📞 ${sanitizeString(phone,30)}` : ''}</p>
           <table style="width:100%;border-collapse:collapse;margin:10px 0">
             <tbody>${itemsHtml}</tbody>
             <tfoot><tr>
@@ -347,6 +347,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           orderId: pi.id,
           name: pi.metadata.client_nom || 'Client',
           email: clientEmail,
+          phone: pi.metadata.client_tel || '',
           mrPoint,
           homeAddress,
           codePromo: pi.metadata.code_promo || '',
@@ -412,7 +413,7 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
   // ── Sanitiser TOUTES les metadata (client + produit + point relais) ─────────
   const safeMetadata = {};
   const metaKeys = [
-    'client_nom', 'client_email', 'produit', 'nb_articles', 'livraison', 'items_json',
+    'client_nom', 'client_email', 'client_tel', 'produit', 'nb_articles', 'livraison', 'items_json',
     'pays', 'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
     'home_street', 'home_cp', 'home_ville',
     'code_promo', 'photo_ids',
@@ -486,7 +487,7 @@ app.post('/update-payment-intent', stripeLimiter, async (req, res) => {
   }
 
   const metaKeys = [
-    'client_nom', 'client_email', 'produit', 'nb_articles', 'livraison', 'items_json',
+    'client_nom', 'client_email', 'client_tel', 'produit', 'nb_articles', 'livraison', 'items_json',
     'pays', 'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
     'home_street', 'home_cp', 'home_ville',
     'code_promo', 'photo_ids',
