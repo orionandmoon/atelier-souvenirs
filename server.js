@@ -322,15 +322,20 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
         // Récupère les photos client stockées temporairement (si l'ID existe encore)
         const photoIds = (pi.metadata.photo_ids || '').split(',').map(s => s.trim()).filter(Boolean);
-        const attachments = photoIds
-          .map(id => photoStore.get(id))
-          .filter(Boolean)
-          .map((entry, i) => ({
+        const previewIds = (pi.metadata.preview_ids || '').split(',').map(s => s.trim()).filter(Boolean);
+        const attachments = [
+          ...photoIds.map(id => photoStore.get(id)).filter(Boolean).map((entry, i) => ({
             filename: `photo-client-${i + 1}.${entry.mimeType.split('/')[1]}`,
             content: entry.data,
             encoding: 'base64',
-          }));
-        photoIds.forEach(id => photoStore.delete(id)); // nettoyage une fois utilisées
+          })),
+          ...previewIds.map(id => photoStore.get(id)).filter(Boolean).map((entry, i) => ({
+            filename: `apercu-avec-texte-${i + 1}.${entry.mimeType.split('/')[1]}`,
+            content: entry.data,
+            encoding: 'base64',
+          })),
+        ];
+        [...photoIds, ...previewIds].forEach(id => photoStore.delete(id)); // nettoyage une fois utilisées
 
         await sendOrderConfirmationEmail({
           email: clientEmail,
@@ -416,7 +421,7 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
     'client_nom', 'client_email', 'client_tel', 'produit', 'nb_articles', 'livraison', 'items_json',
     'pays', 'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
     'home_street', 'home_cp', 'home_ville',
-    'code_promo', 'photo_ids',
+    'code_promo', 'photo_ids', 'preview_ids',
   ];
   metaKeys.forEach(k => {
     if (!metadata[k]) return;
@@ -490,7 +495,7 @@ app.post('/update-payment-intent', stripeLimiter, async (req, res) => {
     'client_nom', 'client_email', 'client_tel', 'produit', 'nb_articles', 'livraison', 'items_json',
     'pays', 'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
     'home_street', 'home_cp', 'home_ville',
-    'code_promo', 'photo_ids',
+    'code_promo', 'photo_ids', 'preview_ids',
   ];
   const safeMetadata = {};
   metaKeys.forEach(k => {
