@@ -132,7 +132,7 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
   const safeId   = sanitizeString(orderId, 50);
   const itemsHtml = items.map(i => `
     <tr>
-      <td style="padding:8px 12px;border-bottom:1px solid #eee">${sanitizeString(i.name, 100)}${i.customText ? `<br><span style="font-size:11px;color:#7a7570">Personnalisation : « ${sanitizeString(i.customText, 100)} »</span>` : ''}</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #eee">${sanitizeString(i.name, 100)}${i.customText ? `<br><span style="font-size:11px;color:#7a7570">Personnalisation : « ${sanitizeString(i.customText, 100)} »${i.customFont ? ` — police : ${sanitizeString(i.customFont, 50)}` : ''}</span>` : ''}</td>
       <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:center">×${sanitizeNumber(i.quantity,1,99)||1}</td>
       <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right">${(parseFloat(i.price)*parseInt(i.quantity)).toFixed(2)} €</td>
     </tr>`).join('');
@@ -203,7 +203,7 @@ async function sendOwnerOrderNotification({ items, total, orderId, name, email, 
   const safeId    = sanitizeString(orderId, 50);
   const itemsHtml = items.map(i => `
     <tr>
-      <td style="padding:6px 10px;border-bottom:1px solid #eee">${sanitizeString(i.name, 100)}${i.customText ? `<br><span style="font-size:11px;color:#c49a3c">Texte : « ${sanitizeString(i.customText, 100)} »</span>` : ''}</td>
+      <td style="padding:6px 10px;border-bottom:1px solid #eee">${sanitizeString(i.name, 100)}${i.customText ? `<br><span style="font-size:11px;color:#c49a3c">Texte : « ${sanitizeString(i.customText, 100)} »${i.customFont ? ` — police : <strong>${sanitizeString(i.customFont, 50)}</strong>` : ''}</span>` : ''}</td>
       <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:center">×${sanitizeNumber(i.quantity,1,99)||1}</td>
       <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right">${(parseFloat(i.price)*parseInt(i.quantity)).toFixed(2)} €</td>
     </tr>`).join('');
