@@ -39,7 +39,7 @@ app.use(rateLimit({
 }));
 
 const stripeLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000, max: 10,
+  windowMs: 10 * 60 * 1000, max: 25,
   message: { error: 'Trop de tentatives de paiement. Réessayez dans 10 minutes.' },
 });
 
@@ -63,12 +63,52 @@ function sanitizeString(str, maxLen = 500) {
 function sanitizeItemsJson(str) {
   if (typeof str !== 'string') return '';
   try {
-    const parsed = JSON.parse(str.trim().slice(0, 3000));
+    const parsed = JSON.parse(str.trim().slice(0, 8000));
     if (!Array.isArray(parsed)) return '';
     return JSON.stringify(parsed.slice(0, 50)); // borne raisonnable du nombre d'articles
   } catch {
     return '';
   }
+}
+
+// Stripe refuse toute valeur de metadata de plus de 500 caractères. Avec 4 articles
+// distincts ou plus, la liste des produits (items_json) dépassait cette limite et la
+// création du paiement échouait : le client voyait « le formulaire de paiement n'a pas
+// pu se charger ». On découpe donc la liste sur plusieurs clés : items_json,
+// items_json_2, items_json_3… (jusqu'à 8), et readItemsJson() les recolle à la lecture.
+const ITEMS_CHUNK = 450;      // marge sous la limite de 500
+const ITEMS_MAX_CHUNKS = 8;   // 8 x 450 = 3 600 caractères, soit largement un panier normal
+
+function setItemsMetadata(target, json) {
+  if (!json) return;
+  const cap = ITEMS_CHUNK * ITEMS_MAX_CHUNKS;
+  if (json.length > cap) {
+    // Panier exceptionnellement gros : version compacte, puis on retire les dernières lignes
+    let arr = JSON.parse(json).map(i => ({
+      name: String(i.name || '').slice(0, 60), price: i.price, quantity: i.quantity,
+      customText: String(i.customText || '').slice(0, 30),
+    }));
+    json = JSON.stringify(arr);
+    while (json.length > cap && arr.length > 1) { arr.pop(); json = JSON.stringify(arr); }
+  }
+  let pos = 0, n = 0;
+  while (pos < json.length && n < ITEMS_MAX_CHUNKS) {
+    let end = Math.min(pos + ITEMS_CHUNK, json.length);
+    // ne jamais couper au milieu d'un emoji (paire de substitution UTF-16)
+    const last = json.charCodeAt(end - 1);
+    if (end < json.length && last >= 0xD800 && last <= 0xDBFF) end -= 1;
+    target[n === 0 ? 'items_json' : 'items_json_' + (n + 1)] = json.slice(pos, end);
+    pos = end; n++;
+  }
+}
+
+function readItemsJson(md) {
+  md = md || {};
+  let s = md.items_json || '';
+  for (let n = 2; n <= ITEMS_MAX_CHUNKS; n++) {
+    if (md['items_json_' + n]) s += md['items_json_' + n];
+  }
+  return s || '[]';
 }
 
 function sanitizeEmail(email) {
@@ -180,6 +220,9 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
       📦 Expédition sous 3-5 jours ouvrés<br>
       🚚 Livraison Mondial Relay point relais
     </div>
+    <div style="background:#fff7ed;border:1px solid #fde0b0;border-radius:10px;padding:16px;font-size:13px;color:#2c3e35;line-height:1.6;margin-top:12px">
+      💡 <strong>L'aperçu vu en ligne n'est qu'indicatif.</strong> On retouche chaque photo à la main avant impression (cadrage, recentrage, qualité) pour un rendu optimal — ce n'est pas parce que l'aperçu ne semble pas parfait que le résultat final le sera pas. Si votre photo nécessite un ajustement important, on vous recontacte avant de l'imprimer.
+    </div>
   </div>
   <div style="background:#fff;border-radius:16px;padding:24px;text-align:center;border:1px solid #e8e4df;margin-bottom:16px">
     <h2 style="font-size:16px;font-weight:700;color:#2c3e35;margin:0 0 8px">⭐ Votre avis compte !</h2>
@@ -235,7 +278,7 @@ async function sendOwnerOrderNotification({ items, total, orderId, name, email, 
   } catch(e) { console.error('Erreur notification propriétaire :', e.message); }
 }
 
-// ─── EMAIL DE RELANCE J+3 (demande d'avis) ───────────────────────────────────
+// ─── EMAIL DE RELANCE J+10 (demande d'avis) ──────────────────────────────────
 async function sendFollowupEmail({ email, name, orderId }) {
   const safeName = sanitizeString(name, 100);
   const safeId   = sanitizeString(orderId, 50);
@@ -306,7 +349,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
     if (clientEmail) {
       try {
-        const items = JSON.parse(pi.metadata.items_json || '[]');
+        const items = JSON.parse(readItemsJson(pi.metadata));
         const mrPoint = pi.metadata.mr_point_nom ? {
           nom:     pi.metadata.mr_point_nom,
           adresse: pi.metadata.mr_point_adr,
@@ -425,9 +468,8 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
   ];
   metaKeys.forEach(k => {
     if (!metadata[k]) return;
-    safeMetadata[k] = k === 'items_json'
-      ? sanitizeItemsJson(String(metadata[k]))
-      : sanitizeString(String(metadata[k]), 500);
+    if (k === 'items_json') setItemsMetadata(safeMetadata, sanitizeItemsJson(String(metadata[k])));
+    else safeMetadata[k] = sanitizeString(String(metadata[k]), 500);
   });
 
   // ── Email client validé ────────────────────────────────────────────────────
@@ -500,9 +542,8 @@ app.post('/update-payment-intent', stripeLimiter, async (req, res) => {
   const safeMetadata = {};
   metaKeys.forEach(k => {
     if (!metadata[k]) return;
-    safeMetadata[k] = k === 'items_json'
-      ? sanitizeItemsJson(String(metadata[k]))
-      : sanitizeString(String(metadata[k]), 500);
+    if (k === 'items_json') setItemsMetadata(safeMetadata, sanitizeItemsJson(String(metadata[k])));
+    else safeMetadata[k] = sanitizeString(String(metadata[k]), 500);
   });
 
   const clientEmail = sanitizeEmail(metadata.client_email || '');
@@ -580,7 +621,7 @@ app.post('/submit-review', reviewLimiter, async (req, res) => {
   res.json({ success: true });
 });
 
-// ─── RELANCE AUTOMATIQUE J+3 ──────────────────────────────────────────────────
+// ─── RELANCE AUTOMATIQUE J+10 ─────────────────────────────────────────────────
 // À appeler une fois par jour (Render Cron Job, ou service externe type
 // cron-job.org) sur : POST /run-followups?key=VOTRE_CLE
 app.post('/run-followups', async (req, res) => {
@@ -590,9 +631,11 @@ app.post('/run-followups', async (req, res) => {
 
   const now = Math.floor(Date.now() / 1000);
   const DAY = 24 * 60 * 60;
-  // Commandes payées il y a entre 3 et 4 jours, pas encore relancées
-  const gte = now - 4 * DAY;
-  const lte = now - 3 * DAY;
+  // Commandes payées il y a entre 10 et 11 jours, pas encore relancées —
+  // laisse le temps de la fabrication (72h) + livraison (3-5 jours) avant
+  // de demander un avis, pour ne pas relancer avant réception du colis.
+  const gte = now - 11 * DAY;
+  const lte = now - 10 * DAY;
 
   let sent = 0, checked = 0, errors = 0;
   try {
@@ -617,7 +660,7 @@ app.post('/run-followups', async (req, res) => {
         errors++;
       }
     }
-    console.log(`🔁 Relances J+3 : ${sent} envoyée(s) / ${checked} commande(s) vérifiée(s)`);
+    console.log(`🔁 Relances J+10 : ${sent} envoyée(s) / ${checked} commande(s) vérifiée(s)`);
     res.json({ checked, sent, errors });
   } catch (err) {
     console.error('Erreur /run-followups :', err.message);
