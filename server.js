@@ -74,41 +74,65 @@ function sanitizeItemsJson(str) {
 // Stripe refuse toute valeur de metadata de plus de 500 caractères. Avec 4 articles
 // distincts ou plus, la liste des produits (items_json) dépassait cette limite et la
 // création du paiement échouait : le client voyait « le formulaire de paiement n'a pas
-// pu se charger ». On découpe donc la liste sur plusieurs clés : items_json,
-// items_json_2, items_json_3… (jusqu'à 8), et readItemsJson() les recolle à la lecture.
-const ITEMS_CHUNK = 450;      // marge sous la limite de 500
-const ITEMS_MAX_CHUNKS = 8;   // 8 x 450 = 3 600 caractères, soit largement un panier normal
+// pu se charger ». On découpe donc les longues valeurs sur plusieurs clés
+// (items_json, items_json_2, items_json_3…) et on les recolle à la lecture.
+// Même principe pour les identifiants de photos (photo_ids, preview_ids).
+const META_CHUNK = 450; // marge sous la limite de 500
+const META_MAX_CHUNKS = { items_json: 8, photo_ids: 4, preview_ids: 4 };
+
+function setChunkedMetadata(target, key, value, clearUnused = false) {
+  const maxChunks = META_MAX_CHUNKS[key] || 1;
+  const cap = META_CHUNK * maxChunks;
+  value = String(value || '');
+  if (value.length > cap) value = value.slice(0, cap);
+  let pos = 0, n = 0;
+  while (pos < value.length && n < maxChunks) {
+    let end = Math.min(pos + META_CHUNK, value.length);
+    // ne jamais couper au milieu d'un emoji (paire de substitution UTF-16)
+    const last = value.charCodeAt(end - 1);
+    if (end < value.length && last >= 0xD800 && last <= 0xDBFF) end -= 1;
+    target[n === 0 ? key : key + '_' + (n + 1)] = value.slice(pos, end);
+    pos = end; n++;
+  }
+  // Mise à jour : les anciens morceaux inutilisés doivent être effacés (chaîne vide chez Stripe)
+  if (clearUnused) {
+    if (n === 0) target[key] = '';
+    for (let k = Math.max(n, 1) + 1; k <= maxChunks; k++) target[key + '_' + k] = '';
+  }
+}
+
+function readChunkedMetadata(md, key) {
+  md = md || {};
+  let out = md[key] || '';
+  for (let n = 2; n <= (META_MAX_CHUNKS[key] || 1); n++) {
+    if (md[key + '_' + n]) out += md[key + '_' + n];
+  }
+  return out;
+}
 
 function setItemsMetadata(target, json) {
   if (!json) return;
-  const cap = ITEMS_CHUNK * ITEMS_MAX_CHUNKS;
+  const cap = META_CHUNK * META_MAX_CHUNKS.items_json;
   if (json.length > cap) {
     // Panier exceptionnellement gros : version compacte, puis on retire les dernières lignes
-    let arr = JSON.parse(json).map(i => ({
+    const arr = JSON.parse(json).map(i => ({
       name: String(i.name || '').slice(0, 60), price: i.price, quantity: i.quantity,
       customText: String(i.customText || '').slice(0, 30),
     }));
     json = JSON.stringify(arr);
     while (json.length > cap && arr.length > 1) { arr.pop(); json = JSON.stringify(arr); }
   }
-  let pos = 0, n = 0;
-  while (pos < json.length && n < ITEMS_MAX_CHUNKS) {
-    let end = Math.min(pos + ITEMS_CHUNK, json.length);
-    // ne jamais couper au milieu d'un emoji (paire de substitution UTF-16)
-    const last = json.charCodeAt(end - 1);
-    if (end < json.length && last >= 0xD800 && last <= 0xDBFF) end -= 1;
-    target[n === 0 ? 'items_json' : 'items_json_' + (n + 1)] = json.slice(pos, end);
-    pos = end; n++;
-  }
+  setChunkedMetadata(target, 'items_json', json);
 }
 
 function readItemsJson(md) {
-  md = md || {};
-  let s = md.items_json || '';
-  for (let n = 2; n <= ITEMS_MAX_CHUNKS; n++) {
-    if (md['items_json_' + n]) s += md['items_json_' + n];
-  }
-  return s || '[]';
+  return readChunkedMetadata(md, 'items_json') || '[]';
+}
+
+// Identifiants de photos : uniquement des UUID séparés par des virgules.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function sanitizePhotoIds(str) {
+  return String(str || '').split(',').map(x => x.trim()).filter(x => UUID_RE.test(x)).join(',');
 }
 
 function sanitizeEmail(email) {
@@ -167,7 +191,7 @@ function sendEmailResend({ to, subject, html, attachments = [] }) {
   });
 }
 
-async function sendOrderConfirmationEmail({ email, name, items, total, orderId, mrPoint, homeAddress }) {
+async function sendOrderConfirmationEmail({ email, name, items, total, orderId, mrPoint, homeAddress, photosMissing = 0 }) {
   const safeName = sanitizeString(name, 100);
   const safeId   = sanitizeString(orderId, 50);
   const itemsHtml = items.map(i => `
@@ -220,6 +244,9 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
       📦 Expédition sous 3-5 jours ouvrés<br>
       🚚 Livraison Mondial Relay point relais
     </div>
+    ${photosMissing > 0 ? `<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:10px;padding:16px;font-size:13px;color:#7f1d1d;margin-bottom:12px;line-height:1.6">
+      📸 <strong>Il nous manque ${photosMissing > 1 ? 'des photos' : 'une photo'} !</strong> Un souci technique nous a empêchés de récupérer ${photosMissing > 1 ? `${photosMissing} de vos photos` : 'une de vos photos'}. Pas d'inquiétude : envoyez-les simplement sur WhatsApp au 06 46 29 17 45, en précisant le modèle de chaque coque. Nous lançons la fabrication dès réception.
+    </div>` : ''}
     <div style="background:#fff7ed;border:1px solid #fde0b0;border-radius:10px;padding:16px;font-size:13px;color:#2c3e35;line-height:1.6;margin-top:12px">
       💡 <strong>L'aperçu vu en ligne n'est qu'indicatif.</strong> On retouche chaque photo à la main avant impression (cadrage, recentrage, qualité) pour un rendu optimal — ce n'est pas parce que l'aperçu ne semble pas parfait que le résultat final le sera pas. Si votre photo nécessite un ajustement important, on vous recontacte avant de l'imprimer.
     </div>
@@ -239,7 +266,25 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
 }
 
 // ─── NOTIFICATION PROPRIÉTAIRE (nouvelle commande) ───────────────────────────
-async function sendOwnerOrderNotification({ items, total, orderId, name, email, phone, mrPoint, homeAddress, codePromo, attachments = [] }) {
+// Bloc d'avertissement photos de l'e-mail propriétaire.
+function photoWarningHtml({ attachments, photosExpected, photosMissing, previewsMissing, phone, email }) {
+  const contact = [phone ? `📞 ${sanitizeString(phone, 30)}` : '', email ? `✉️ ${sanitizeString(email, 150)}` : ''].filter(Boolean).join(' — ');
+  const okLine = attachments.length
+    ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">🖼️ ${attachments.length} photo(s) client jointe(s) à cet email</p>` : '';
+  if (photosMissing > 0 || previewsMissing > 0) {
+    const what = photosMissing > 0
+      ? `${photosMissing} photo(s) sur ${photosExpected} n'ont pas pu être récupérées`
+      : `${previewsMissing} aperçu(s) avec texte n'ont pas pu être récupérés`;
+    return okLine + `<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:10px;padding:12px 14px;margin:10px 0 0;font-size:13px;color:#b91c1c;line-height:1.5">
+      ⚠️ <strong>${what}</strong> (en général parce que le serveur s'est endormi ou a redémarré avant la commande).<br>
+      Redemande-les au client avant de lancer la fabrication${contact ? ' : ' + contact : ''}.
+    </div>`;
+  }
+  if (attachments.length) return okLine;
+  return '<p style="font-size:13px;color:#b91c1c;margin:8px 0 0">⚠️ Aucune photo jointe — commande sans personnalisation image, ou photo non reçue</p>';
+}
+
+async function sendOwnerOrderNotification({ items, total, orderId, name, email, phone, mrPoint, homeAddress, codePromo, attachments = [], photosExpected = 0, photosMissing = 0, previewsMissing = 0 }) {
   if (!process.env.OWNER_EMAIL) return;
 
   const safeName  = sanitizeString(name, 100);
@@ -268,7 +313,7 @@ async function sendOwnerOrderNotification({ items, total, orderId, name, email, 
           </table>
           ${codePromo ? `<p style="font-size:13px;color:#c49a3c;margin:8px 0 0">🏷️ Code promo utilisé : <strong>${sanitizeString(codePromo,50)}</strong></p>` : ''}
           ${mrPoint ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">📍 Relais : ${sanitizeString(mrPoint.nom,100)} — ${sanitizeString(mrPoint.ville,100)}</p>` : homeAddress ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">📦 Domicile : ${sanitizeString(homeAddress.street,200)}, ${sanitizeString(homeAddress.cp,10)} ${sanitizeString(homeAddress.ville,100)}, ${sanitizeString(COUNTRY_NAMES[homeAddress.pays] || homeAddress.pays,50)}</p>` : ''}
-          ${attachments.length ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">🖼️ ${attachments.length} photo(s) client jointe(s) à cet email</p>` : '<p style="font-size:13px;color:#b91c1c;margin:8px 0 0">⚠️ Aucune photo jointe — commande sans personnalisation image, ou photo non reçue</p>'}
+          ${photoWarningHtml({ attachments, photosExpected, photosMissing, previewsMissing, phone, email })}
           <p style="font-size:12px;color:#7a7570;margin-top:12px">Réf. : #${safeId.slice(-8).toUpperCase()}</p>
         </div>
       </div>`,
@@ -364,8 +409,13 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         } : null;
 
         // Récupère les photos client stockées temporairement (si l'ID existe encore)
-        const photoIds = (pi.metadata.photo_ids || '').split(',').map(s => s.trim()).filter(Boolean);
-        const previewIds = (pi.metadata.preview_ids || '').split(',').map(s => s.trim()).filter(Boolean);
+        const photoIds = readChunkedMetadata(pi.metadata, 'photo_ids').split(',').map(s => s.trim()).filter(Boolean);
+        const previewIds = readChunkedMetadata(pi.metadata, 'preview_ids').split(',').map(s => s.trim()).filter(Boolean);
+        // Photos annoncées par la commande mais introuvables sur le serveur (ex. serveur
+        // redémarré entre l'envoi de la photo et le paiement) : on le signale clairement.
+        const photosExpected = photoIds.length;                       // photos d'origine du client
+        const photosMissing  = photoIds.filter(id => !photoStore.has(id)).length;
+        const previewsMissing = previewIds.filter(id => !photoStore.has(id)).length;
         const attachments = [
           ...photoIds.map(id => photoStore.get(id)).filter(Boolean).map((entry, i) => ({
             filename: `photo-client-${i + 1}.${entry.mimeType.split('/')[1]}`,
@@ -388,6 +438,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           orderId: pi.id,
           mrPoint,
           homeAddress,
+          photosMissing,
         });
         await sendOwnerOrderNotification({
           items,
@@ -400,6 +451,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           homeAddress,
           codePromo: pi.metadata.code_promo || '',
           attachments,
+          photosExpected, photosMissing, previewsMissing,
         });
       } catch(e) { console.error('Erreur email :', e.message); }
     }
@@ -422,8 +474,23 @@ setInterval(() => {
 }, 30 * 60 * 1000);
 
 const photoUploadLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 40,
+  windowMs: 15 * 60 * 1000, max: 120,
   message: { error: 'Trop d\'envois de photos, réessayez dans quelques minutes.' },
+});
+
+// Le navigateur demande quelles photos de son panier existent encore ici : le serveur
+// gratuit s'endort et redémarre, ce qui vide la mémoire. Celles qui manquent sont
+// renvoyées par le navigateur (qui en garde une copie) juste avant le paiement.
+const photoStatusLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 60 });
+app.post('/photos-status', photoStatusLimiter, express.json({ limit: '10kb' }), (req, res) => {
+  const ids = Array.isArray(req.body && req.body.ids) ? req.body.ids.slice(0, 60) : [];
+  const present = [];
+  for (const id of ids) {
+    if (typeof id !== 'string' || !UUID_RE.test(id)) continue;
+    const entry = photoStore.get(id);
+    if (entry) { entry.createdAt = Date.now(); present.push(id); } // repousse l'expiration
+  }
+  res.json({ present });
 });
 
 app.post('/upload-photo', photoUploadLimiter, express.json({ limit: '12mb' }), (req, res) => {
@@ -469,6 +536,7 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
   metaKeys.forEach(k => {
     if (!metadata[k]) return;
     if (k === 'items_json') setItemsMetadata(safeMetadata, sanitizeItemsJson(String(metadata[k])));
+    else if (k === 'photo_ids' || k === 'preview_ids') setChunkedMetadata(safeMetadata, k, sanitizePhotoIds(metadata[k]));
     else safeMetadata[k] = sanitizeString(String(metadata[k]), 500);
   });
 
@@ -541,6 +609,12 @@ app.post('/update-payment-intent', stripeLimiter, async (req, res) => {
   ];
   const safeMetadata = {};
   metaKeys.forEach(k => {
+    if (k === 'photo_ids' || k === 'preview_ids') {
+      // Ici une chaîne vide est une vraie valeur : « plus aucune photo » efface l'ancienne liste.
+      if (metadata[k] === undefined || metadata[k] === null) return;
+      setChunkedMetadata(safeMetadata, k, sanitizePhotoIds(metadata[k]), true);
+      return;
+    }
     if (!metadata[k]) return;
     if (k === 'items_json') setItemsMetadata(safeMetadata, sanitizeItemsJson(String(metadata[k])));
     else safeMetadata[k] = sanitizeString(String(metadata[k]), 500);
