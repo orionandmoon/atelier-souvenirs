@@ -57,6 +57,21 @@ function sanitizeString(str, maxLen = 500) {
     .replace(/[\x00-\x1F\x7F]/g, '');
 }
 
+// Pour noms et adresses : on garde les apostrophes (rue de l'Église, D'Angelo…),
+// que sanitizeString supprime. L'échappement HTML se fait à l'affichage (escHtml).
+function cleanText(str, maxLen = 200) {
+  if (typeof str !== 'string') return '';
+  return str.replace(/[\x00-\x1F\x7F]/g, '').replace(/<[^>]*>/g, '').replace(/[<>`;]/g, '').trim().slice(0, maxLen);
+}
+function escHtml(str) {
+  return String(str == null ? '' : str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+const TEXT_META_KEYS = new Set([
+  'client_nom', 'client_prenom', 'client_nom_famille',
+  'mr_point_nom', 'mr_point_adr', 'mr_point_ville',
+  'home_street', 'home_street2', 'home_ville',
+]);
+
 // items_json a besoin de ses guillemets pour rester du JSON valide —
 // sanitizeString les détruirait. On valide la structure autrement :
 // on parse, on vérifie que c'est bien un tableau, on re-sérialise proprement.
@@ -192,7 +207,7 @@ function sendEmailResend({ to, subject, html, attachments = [] }) {
 }
 
 async function sendOrderConfirmationEmail({ email, name, items, total, orderId, mrPoint, homeAddress, photosMissing = 0 }) {
-  const safeName = sanitizeString(name, 100);
+  const safeName = escHtml(cleanText(name, 100));
   const safeId   = sanitizeString(orderId, 50);
   const itemsHtml = items.map(i => `
     <tr>
@@ -204,13 +219,13 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
   const mrHtml = mrPoint ? `
     <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:10px;padding:16px;margin-top:12px;font-size:13px;color:#2c3e35">
       📍 <strong>Point relais Mondial Relay</strong><br>
-      ${sanitizeString(mrPoint.nom, 100)}<br>
-      ${sanitizeString(mrPoint.adresse, 200)}, ${sanitizeString(mrPoint.cp, 10)} ${sanitizeString(mrPoint.ville, 100)}
+      ${escHtml(cleanText(mrPoint.nom, 100))}<br>
+      ${escHtml(cleanText(mrPoint.adresse, 200))}, ${escHtml(cleanText(mrPoint.cp, 10))} ${escHtml(cleanText(mrPoint.ville, 100))}
     </div>` : homeAddress ? `
     <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:10px;padding:16px;margin-top:12px;font-size:13px;color:#2c3e35">
       📦 <strong>Livraison à domicile (Colissimo)</strong><br>
-      ${sanitizeString(homeAddress.street, 200)}<br>
-      ${sanitizeString(homeAddress.cp, 10)} ${sanitizeString(homeAddress.ville, 100)}, ${sanitizeString(COUNTRY_NAMES[homeAddress.pays] || homeAddress.pays, 50)}
+      ${escHtml(cleanText(homeAddress.street, 200))}<br>
+      ${escHtml(cleanText(homeAddress.cp, 10))} ${escHtml(cleanText(homeAddress.ville, 100))}, ${escHtml(COUNTRY_NAMES[homeAddress.pays] || homeAddress.pays)}
     </div>` : '';
 
   await sendEmailResend({
@@ -265,6 +280,40 @@ async function sendOrderConfirmationEmail({ email, name, items, total, orderId, 
   console.log(`📧 Email envoyé à ${email}`);
 }
 
+// ─── FICHE D'EXPÉDITION (tout ce que demande Boxtal, prêt à recopier) ─────────
+function shippingSheetHtml({ prenom, nomFamille, name, email, phone, homeAddress, mrPoint, pays }) {
+  let p = (prenom || '').trim(), n = (nomFamille || '').trim();
+  if (!p && !n && name) { const parts = String(name).trim().split(/\s+/); p = parts.shift() || ''; n = parts.join(' '); }
+  const row = (label, value) => value
+    ? `<tr><td style="padding:3px 12px 3px 0;color:#7a7570;white-space:nowrap;vertical-align:top;font-size:13px">${label}</td><td style="padding:3px 0;color:#2c3e35;font-weight:600;font-size:14px">${escHtml(value)}</td></tr>` : '';
+  const paysName = COUNTRY_NAMES[pays] || pays || '';
+  const hasStreet = !!(homeAddress && homeAddress.street);
+  const mode = mrPoint ? 'Mondial Relay — point relais' : (homeAddress ? 'Colissimo — domicile' : '');
+  const contact = [phone ? `📞 ${escHtml(phone)}` : '', email ? `✉️ ${escHtml(email)}` : ''].filter(Boolean).join(' — ');
+  const warn = (!hasStreet && pays === 'FR')
+    ? `<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:10px 12px;margin-top:10px;font-size:13px;color:#b91c1c;line-height:1.5">⚠️ <strong>Adresse du client non renseignée</strong> (commande passée avec l'ancien formulaire). Demande-la avant d'éditer l'étiquette${contact ? ' : ' + contact : ''}.</div>` : '';
+  return `<div style="background:#fffbeb;border:1px solid #f5d499;border-radius:10px;padding:14px 16px;margin:14px 0 0">
+    <div style="font-size:11px;letter-spacing:1.5px;font-weight:700;color:#8a6a1a;margin-bottom:8px">📦 FICHE D'EXPÉDITION — À RECOPIER DANS BOXTAL</div>
+    <table style="border-collapse:collapse"><tbody>
+      ${row('Mode', mode)}
+      ${row('Prénom', p)}
+      ${row('Nom', n)}
+      ${row('E-mail', email)}
+      ${row('Téléphone', phone)}
+      ${row('Adresse', hasStreet ? homeAddress.street : '')}
+      ${row('Complément', hasStreet ? homeAddress.street2 : '')}
+      ${row('Code postal', homeAddress ? homeAddress.cp : '')}
+      ${row('Ville', homeAddress ? homeAddress.ville : '')}
+      ${row('Pays', paysName)}
+      ${mrPoint ? `<tr><td colspan="2" style="padding:10px 0 2px;font-size:11px;letter-spacing:1px;font-weight:700;color:#8a6a1a">POINT RELAIS CHOISI</td></tr>
+      ${row('Code relais', mrPoint.id)}
+      ${row('Nom', mrPoint.nom)}
+      ${row('Adresse', mrPoint.adresse)}
+      ${row('CP / Ville', [mrPoint.cp, mrPoint.ville].filter(Boolean).join(' '))}` : ''}
+    </tbody></table>${warn}
+  </div>`;
+}
+
 // ─── NOTIFICATION PROPRIÉTAIRE (nouvelle commande) ───────────────────────────
 // Bloc d'avertissement photos de l'e-mail propriétaire.
 function photoWarningHtml({ attachments, photosExpected, photosMissing, previewsMissing, phone, email }) {
@@ -284,10 +333,10 @@ function photoWarningHtml({ attachments, photosExpected, photosMissing, previews
   return '<p style="font-size:13px;color:#b91c1c;margin:8px 0 0">⚠️ Aucune photo jointe — commande sans personnalisation image, ou photo non reçue</p>';
 }
 
-async function sendOwnerOrderNotification({ items, total, orderId, name, email, phone, mrPoint, homeAddress, codePromo, attachments = [], photosExpected = 0, photosMissing = 0, previewsMissing = 0 }) {
+async function sendOwnerOrderNotification({ items, total, orderId, name, prenom, nomFamille, pays, email, phone, mrPoint, homeAddress, codePromo, attachments = [], photosExpected = 0, photosMissing = 0, previewsMissing = 0 }) {
   if (!process.env.OWNER_EMAIL) return;
 
-  const safeName  = sanitizeString(name, 100);
+  const safeName  = escHtml(cleanText(name, 100));
   const safeId    = sanitizeString(orderId, 50);
   const itemsHtml = items.map(i => `
     <tr>
@@ -312,7 +361,7 @@ async function sendOwnerOrderNotification({ items, total, orderId, name, email, 
             </tr></tfoot>
           </table>
           ${codePromo ? `<p style="font-size:13px;color:#c49a3c;margin:8px 0 0">🏷️ Code promo utilisé : <strong>${sanitizeString(codePromo,50)}</strong></p>` : ''}
-          ${mrPoint ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">📍 Relais : ${sanitizeString(mrPoint.nom,100)} — ${sanitizeString(mrPoint.ville,100)}</p>` : homeAddress ? `<p style="font-size:13px;color:#2c3e35;margin:8px 0 0">📦 Domicile : ${sanitizeString(homeAddress.street,200)}, ${sanitizeString(homeAddress.cp,10)} ${sanitizeString(homeAddress.ville,100)}, ${sanitizeString(COUNTRY_NAMES[homeAddress.pays] || homeAddress.pays,50)}</p>` : ''}
+          ${shippingSheetHtml({ prenom, nomFamille, name, email, phone, homeAddress, mrPoint, pays })}
           ${photoWarningHtml({ attachments, photosExpected, photosMissing, previewsMissing, phone, email })}
           <p style="font-size:12px;color:#7a7570;margin-top:12px">Réf. : #${safeId.slice(-8).toUpperCase()}</p>
         </div>
@@ -389,13 +438,14 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     console.log(`   Produit : ${pi.metadata.produit || 'N/A'}`);
     console.log(`   Pays    : ${COUNTRY_NAMES[pi.metadata.pays] || pi.metadata.pays || 'N/A'}`);
     console.log(`   Relais  : ${pi.metadata.mr_point_nom || 'N/A'} — ${pi.metadata.mr_point_ville || 'N/A'}`);
-    if (pi.metadata.home_street) console.log(`   Domicile: ${pi.metadata.home_street}, ${pi.metadata.home_cp} ${pi.metadata.home_ville}`);
+    if (pi.metadata.home_street) console.log(`   Adresse : ${pi.metadata.home_street}, ${pi.metadata.home_cp} ${pi.metadata.home_ville}`);
     if (pi.metadata.code_promo) console.log(`   Code    : ${pi.metadata.code_promo}`);
 
     if (clientEmail) {
       try {
         const items = JSON.parse(readItemsJson(pi.metadata));
         const mrPoint = pi.metadata.mr_point_nom ? {
+          id:      pi.metadata.mr_point_id,
           nom:     pi.metadata.mr_point_nom,
           adresse: pi.metadata.mr_point_adr,
           cp:      pi.metadata.mr_point_cp,
@@ -403,6 +453,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         } : null;
         const homeAddress = pi.metadata.home_street ? {
           street: pi.metadata.home_street,
+          street2: pi.metadata.home_street2 || '',
           cp:     pi.metadata.home_cp,
           ville:  pi.metadata.home_ville,
           pays:   pi.metadata.pays,
@@ -445,6 +496,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           total: pi.amount / 100,
           orderId: pi.id,
           name: pi.metadata.client_nom || 'Client',
+          prenom: pi.metadata.client_prenom || '',
+          nomFamille: pi.metadata.client_nom_famille || '',
+          pays: pi.metadata.pays || '',
           email: clientEmail,
           phone: pi.metadata.client_tel || '',
           mrPoint,
@@ -528,16 +582,16 @@ app.post('/create-payment-intent', stripeLimiter, async (req, res) => {
   // ── Sanitiser TOUTES les metadata (client + produit + point relais) ─────────
   const safeMetadata = {};
   const metaKeys = [
-    'client_nom', 'client_email', 'client_tel', 'produit', 'nb_articles', 'livraison', 'items_json',
+    'client_nom', 'client_prenom', 'client_nom_famille', 'client_email', 'client_tel', 'produit', 'nb_articles', 'livraison', 'items_json',
     'pays', 'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
-    'home_street', 'home_cp', 'home_ville',
+    'home_street', 'home_street2', 'home_cp', 'home_ville',
     'code_promo', 'photo_ids', 'preview_ids',
   ];
   metaKeys.forEach(k => {
     if (!metadata[k]) return;
     if (k === 'items_json') setItemsMetadata(safeMetadata, sanitizeItemsJson(String(metadata[k])));
     else if (k === 'photo_ids' || k === 'preview_ids') setChunkedMetadata(safeMetadata, k, sanitizePhotoIds(metadata[k]));
-    else safeMetadata[k] = sanitizeString(String(metadata[k]), 500);
+    else safeMetadata[k] = TEXT_META_KEYS.has(k) ? cleanText(String(metadata[k]), 200) : sanitizeString(String(metadata[k]), 500);
   });
 
   // ── Email client validé ────────────────────────────────────────────────────
@@ -602,9 +656,9 @@ app.post('/update-payment-intent', stripeLimiter, async (req, res) => {
   }
 
   const metaKeys = [
-    'client_nom', 'client_email', 'client_tel', 'produit', 'nb_articles', 'livraison', 'items_json',
+    'client_nom', 'client_prenom', 'client_nom_famille', 'client_email', 'client_tel', 'produit', 'nb_articles', 'livraison', 'items_json',
     'pays', 'mr_point_id', 'mr_point_nom', 'mr_point_adr', 'mr_point_cp', 'mr_point_ville',
-    'home_street', 'home_cp', 'home_ville',
+    'home_street', 'home_street2', 'home_cp', 'home_ville',
     'code_promo', 'photo_ids', 'preview_ids',
   ];
   const safeMetadata = {};
@@ -617,7 +671,7 @@ app.post('/update-payment-intent', stripeLimiter, async (req, res) => {
     }
     if (!metadata[k]) return;
     if (k === 'items_json') setItemsMetadata(safeMetadata, sanitizeItemsJson(String(metadata[k])));
-    else safeMetadata[k] = sanitizeString(String(metadata[k]), 500);
+    else safeMetadata[k] = TEXT_META_KEYS.has(k) ? cleanText(String(metadata[k]), 200) : sanitizeString(String(metadata[k]), 500);
   });
 
   const clientEmail = sanitizeEmail(metadata.client_email || '');
